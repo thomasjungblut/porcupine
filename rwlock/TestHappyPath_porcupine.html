@@ -1,0 +1,786 @@
+
+<!DOCTYPE html>
+<html>
+  <head><title>Porcupine</title>
+    <style>
+html {
+  font-family: Helvetica, Arial, sans-serif;
+  font-size: 16px;
+}
+
+text {
+  dominant-baseline: middle;
+}
+
+#legend {
+  position: fixed;
+  left: 10px;
+  top: 10px;
+  background-color: rgba(255, 255, 255, 0.5);
+  backdrop-filter: blur(3px);
+  padding: 5px 2px 1px 2px;
+  border-radius: 4px;
+}
+
+#canvas {
+  margin-top: 45px;
+}
+
+#calc {
+  width: 0;
+  height: 0;
+  visibility: hidden;
+}
+
+.bg {
+  fill: transparent;
+}
+
+.divider {
+  stroke: #ccc;
+  stroke-width: 1;
+}
+
+.history-rect {
+  stroke: #888;
+  stroke-width: 1;
+  fill: #42d1f5;
+}
+
+.link {
+  fill: #206475;
+  cursor: pointer;
+}
+
+.selected {
+  stroke-width: 5;
+}
+
+.target-rect {
+  opacity: 0;
+}
+
+.history-text {
+  font-size: 0.9rem;
+  font-family: Menlo, Courier New, monospace;
+}
+
+.hidden {
+  opacity: 0.2;
+}
+
+.hidden line {
+  opacity: 0.5; /* note: this is multiplicative */
+}
+
+.linearization {
+  stroke: rgba(0, 0, 0, 0.5);
+}
+
+.linearization-invalid {
+  stroke: rgba(255, 0, 0, 0.5);
+}
+
+.linearization-point {
+  stroke-width: 5;
+}
+
+.linearization-line {
+  stroke-width: 2;
+}
+
+.tooltip {
+  position: absolute;
+  opacity: 0;
+  border: 1px solid #ccc;
+  background: white;
+  border-radius: 4px;
+  padding: 5px;
+  font-size: 0.8rem;
+}
+
+.inactive {
+  display: none;
+}
+    </style>
+  </head>
+  <body>
+    <div id="legend">
+      <svg xmlns="http://www.w3.org/2000/svg" width="660" height="20">
+        <text x="0" y="10">Clients</text>
+        <line x1="50" y1="0" x2="70" y2="20" stroke="#000" stroke-width="1"></line>
+        <text x="70" y="10">Time</text>
+        <line x1="110" y1="10" x2="200" y2="10" stroke="#000" stroke-width="2"></line>
+        <polygon points="200,5 200,15, 210,10" fill="#000"></polygon>
+        <rect x="300" y="5" width="10" height="10" fill="rgba(0, 0, 0, 0.5)"></rect>
+        <text x="315" y="10">Valid LP</text>
+        <rect x="400" y="5" width="10" height="10" fill="rgba(255, 0, 0, 0.5)"></rect>
+        <text x="415" y="10">Invalid LP</text>
+        <text x="520" y="10" id="jump-link" class="link">[ jump to first error ]</text>
+      </svg>
+    </div>
+    <div id="canvas">
+    </div>
+    <div id="calc">
+    </div>
+    <script>
+      'use strict'
+
+      const SVG_NS = 'http://www.w3.org/2000/svg'
+
+      function svgnew(tag, attrs) {
+        const el = document.createElementNS(SVG_NS, tag)
+        svgattr(el, attrs)
+        return el
+      }
+
+      function svgattr(el, attrs) {
+        if (attrs != null) {
+          for (var k in attrs) {
+            if (Object.prototype.hasOwnProperty.call(attrs, k)) {
+              el.setAttributeNS(null, k, attrs[k])
+            }
+          }
+        }
+      }
+
+      function svgattach(parent, child) {
+        return parent.appendChild(child)
+      }
+
+      function svgadd(el, tag, attrs) {
+        return svgattach(el, svgnew(tag, attrs))
+      }
+
+      function newArray(n, fn) {
+        const arr = new Array(n)
+        for (let i = 0; i < n; i++) {
+          arr[i] = fn(i)
+        }
+        return arr
+      }
+
+      function arrayEq(a, b) {
+        if (a === b) {
+          return true
+        }
+        if (a == null || b == null) {
+          return false
+        }
+        if (a.length != b.length) {
+          return false
+        }
+        for (let i = 0; i < a.length; i++) {
+          if (a[i] !== b[i]) {
+            return false
+          }
+        }
+        return true
+      }
+
+      function render(data) {
+        const PADDING = 10
+        const BOX_HEIGHT = 30
+        const BOX_SPACE = 15
+        const XOFF = 20
+        const EPSILON = 20
+        const LINE_BLEED = 5
+        const BOX_GAP = 20
+        const BOX_TEXT_PADDING = 10
+        const HISTORY_RECT_RADIUS = 4
+
+        let maxClient = -1
+        data.forEach(partition => {
+          partition['History'].forEach(el => {
+            maxClient = Math.max(maxClient, el['ClientId'])
+          })
+        })
+        const nClient = maxClient + 1
+
+        // Prepare some useful data to be used later:
+        // - Add a GID to each event
+        // - Create a mapping from GIDs back to events
+        // - Create a set of all timestamps
+        // - Create a set of all start timestamps
+        const allTimestamps = new Set()
+        const startTimestamps = new Set()
+        let gid = 0
+        const byGid = {}
+        data.forEach(partition => {
+          partition['History'].forEach(el => {
+            allTimestamps.add(el['Start'])
+            startTimestamps.add(el['Start'])
+            allTimestamps.add(el['End'])
+            // give elements GIDs
+            el['Gid'] = gid
+            byGid[gid] = el
+            gid++
+          })
+        })
+        let sortedTimestamps = Array.from(allTimestamps).sort((a, b) => a - b)
+
+        // This should not happen with "real" histories, but for certain edge
+        // cases, we need to deal with having multiple events share a start/end
+        // time. We solve this by tweaking the events that share the end time,
+        // updating the time to end+epsilon. In practice, rather than having to
+        // choose an epsilon, we choose to average the value with the next largest
+        // timestamp.
+        const nextTs = {}
+        for (let i = 0; i < sortedTimestamps.length-1; i++) {
+          nextTs[sortedTimestamps[i]] = sortedTimestamps[i+1]
+        }
+        data.forEach(partition => {
+          partition['History'].forEach(el => {
+            let end = el['End']
+            el['OriginalEnd'] = end // for display purposes
+            if (startTimestamps.has(end)) {
+              if (Object.prototype.hasOwnProperty.call(nextTs, end)) {
+                const tweaked = (end + nextTs[end])/2
+                el['End'] = tweaked
+                allTimestamps.add(tweaked)
+              }
+            }
+          })
+        })
+        // Update sortedTimestamps, because we created some new timestamps.
+        sortedTimestamps = Array.from(allTimestamps).sort((a, b) => a - b)
+
+        // Compute layout.
+        //
+        // We warp time to make it easier to see what's going on. We can think
+        // of there being a monotonically increasing mapping from timestamps to
+        // x-positions. This mapping should satisfy some criteria to make the
+        // visualization interpretable:
+        //
+        // - distinguishability: there should be some minimum distance between
+        // unequal timestamps
+        // - visible text: history boxes should be wide enough to fit the text
+        // they contain
+        // - enough space for LPs: history boxes should be wide enough to fit
+        // all linearization points that go through them, while maintaining
+        // readability of linearizations (where each LP in a sequence is spaced
+        // some minimum distance away from the previous one)
+        //
+        // Originally, I thought about this as a linear program:
+        //
+        // - variables for every unique timestamp, x_i = warp(timestamp_i)
+        // - objective: minimize sum x_i
+        // - constraint: non-negative
+        // - constraint: ordering + distinguishability, timestamp_i < timestamp_j -> x_i + EPS < x_j
+        // - constraint: visible text, size_text_j < x_{timestamp_j_end} - x_{timestamp_j_start}
+        // - constraint: linearization lines have points that fit within box, ...
+        //
+        // This used to actually be implemented using an LP solver (without the
+        // linearization point part, though that should be doable too), but
+        // then I realized it's possible to solve optimally using a greedy
+        // left-to-right scan in linear time.
+        //
+        // So that is what we do here. We optimally solve the above, and while
+        // doing so, also compute some useful information (e.g. x-positions of
+        // linearization points) that is useful later.
+        const xPos = {}
+        // Compute some information about history elements, sorted by end time;
+        // the most important information here is box width.
+        const byEnd = data.flatMap(partition =>
+          partition['History'].map(el => {
+            // compute width of the text inside the history element by actually
+            // drawing it (in a hidden div)
+            const scratch = document.getElementById('calc')
+            scratch.innerHTML = ''
+            const svg = svgadd(scratch, 'svg')
+            const text = svgadd(svg, 'text', {
+              'text-anchor': 'middle',
+              'class': 'history-text',
+            })
+            text.textContent = el['Description']
+            const bbox = text.getBBox()
+            const width = bbox.width + 2*BOX_TEXT_PADDING
+            return {
+              'start': el['Start'],
+              'end': el['End'],
+              'width': width,
+              'gid': el['Gid']
+            }
+          })
+        ).sort((a, b) => a.end - b.end)
+        // Some preprocessing for linearization points and illegal next
+        // linearizations. We need to figure out where exactly LPs end up
+        // as we go, so we can make sure event boxes are wide enough.
+        const eventToLinearizations = newArray(gid, () => []) // event -> [{index, position}]
+        const eventIllegalLast = newArray(gid, () => []) // event -> [index]
+        const allLinearizations = []
+        let lgid = 0
+        data.forEach(partition => {
+          partition['PartialLinearizations'].forEach(lin => {
+            const globalized = [] // linearization with global indexes instead of partition-local ones
+            const included = new Set() // for figuring out illegal next LPs
+            lin.forEach((id, position) => {
+              included.add(id['Index'])
+              const gid = partition['History'][id['Index']]['Gid']
+              globalized.push(gid)
+              eventToLinearizations[gid].push({'index': lgid, 'position': position})
+            })
+            allLinearizations.push(globalized)
+            let minEnd = Infinity
+            partition['History'].forEach((el, index) => {
+              if (!included.has(index)) {
+                minEnd = Math.min(minEnd, el['End'])
+              }
+            })
+            partition['History'].forEach((el, index) => {
+              if (!included.has(index) && el['Start'] < minEnd) {
+                eventIllegalLast[el['Gid']].push(lgid)
+              }
+            })
+            lgid++
+          })
+        })
+        const linearizationPositions = newArray(lgid, () => []) // [[xpos]]
+        // Okay, now we're ready to do the left-to-right scan.
+        // Solve timestamp -> xPos.
+        let eventIndex = 0
+        xPos[sortedTimestamps[0]] = 0 // positions start at 0
+        for (let i = 1; i < sortedTimestamps.length; i++) {
+          // left-to-right scan, finding minimum time we can use
+          const ts = sortedTimestamps[i]
+          // ensure some gap from last timestamp
+          let pos = xPos[sortedTimestamps[i-1]] + BOX_GAP
+          // ensure that text fits in boxes
+          while (eventIndex < byEnd.length && byEnd[eventIndex].end <= ts) {
+            // push our position as far as necessary to accommodate text in box
+            const event = byEnd[eventIndex]
+            const textEndPos = xPos[event.start] + event.width
+            pos = Math.max(pos, textEndPos)
+            // Ensure that LPs fit in box.
+            //
+            // When placing the end of an event, for all partial linearizations
+            // that include that event, for the prefix that comes before that event,
+            // all their start points must have been placed already, so we can figure
+            // out the minimum width that the box needs to be to accommodate the LP.
+            eventToLinearizations[event.gid]
+              .concat(eventIllegalLast[event.gid].map(index => {
+                return {
+                  'index': index,
+                  'position': allLinearizations[index].length-1,
+                }
+              }))
+              .forEach(li => {
+                const {index, position} = li
+                for (let i = linearizationPositions[index].length; i <= position; i++) {
+                  // determine past points
+                  let prev = null
+                  if (linearizationPositions[index].length != 0) {
+                    prev = linearizationPositions[index][i-1]
+                  }
+                  const nextGid = allLinearizations[index][i]
+                  let nextPos
+                  if (prev === null) {
+                    nextPos = xPos[byGid[nextGid]['Start']]
+                  } else {
+                    nextPos = Math.max(xPos[byGid[nextGid]['Start']], prev + EPSILON)
+                  }
+                  linearizationPositions[index].push(nextPos)
+                }
+                // this next line only really makes sense for the ones in
+                // eventToLinearizations, not the ones from eventIllegalLast,
+                // but it's safe to do it for all points, so we don't bother to
+                // distinguish.
+                pos = Math.max(pos, linearizationPositions[index][position])
+              })
+            // ensure that illegal next LPs fit in box too
+            eventIllegalLast[event.gid].forEach(li => {
+              const lin = linearizationPositions[li]
+              const prev = lin[lin.length-1]
+              pos = Math.max(pos, prev + EPSILON)
+            })
+
+            eventIndex++
+          }
+          xPos[ts] = pos
+        }
+
+        // Solved, now draw UI.
+
+        let selected = false
+        let selectedIndex = [-1, -1]
+
+        const height = 2*PADDING + BOX_HEIGHT * nClient + BOX_SPACE * (nClient - 1)
+        const width = 2*PADDING + XOFF + xPos[sortedTimestamps[sortedTimestamps.length-1]]
+        const svg = svgadd(document.getElementById('canvas'), 'svg', {
+          'width': width,
+          'height': height,
+        })
+
+        // draw background, etc.
+        const bg = svgadd(svg, 'g')
+        const bgRect = svgadd(bg, 'rect', {
+          'height': height,
+          'width': width,
+          'x': 0,
+          'y': 0,
+          'class': 'bg',
+        })
+        bgRect.onclick = handleBgClick
+        for (let i = 0; i < nClient; i++) {
+          const text = svgadd(bg, 'text', {
+            'x': XOFF/2,
+            'y': PADDING + BOX_HEIGHT/2 + i * (BOX_HEIGHT + BOX_SPACE),
+            'text-anchor': 'middle',
+          })
+          text.textContent = i
+        }
+        svgadd(bg, 'line', {
+          'x1': PADDING + XOFF,
+          'y1': PADDING,
+          'x2': PADDING + XOFF,
+          'y2': height - PADDING,
+          'class': 'divider'
+        })
+
+        // draw history
+        const historyLayers = []
+        const historyRects = []
+        const targetRects = svgnew('g')
+        data.forEach((partition, partitionIndex) => {
+          const l = svgadd(svg, 'g')
+          historyLayers.push(l)
+          const rects = []
+          partition['History'].forEach((el, elIndex) => {
+            const g = svgadd(l, 'g')
+            const rx = xPos[el['Start']]
+            const width = xPos[el['End']] - rx
+            const x = rx + XOFF + PADDING
+            const y = PADDING + el['ClientId'] * (BOX_HEIGHT + BOX_SPACE)
+            rects.push(svgadd(g, 'rect', {
+              'height': BOX_HEIGHT,
+              'width': width,
+              'x': x,
+              'y': y,
+              'rx': HISTORY_RECT_RADIUS,
+              'ry': HISTORY_RECT_RADIUS,
+              'class': 'history-rect'
+            }))
+            const text = svgadd(g, 'text', {
+              'x': x + width/2,
+              'y': y + BOX_HEIGHT/2,
+              'text-anchor': 'middle',
+              'class': 'history-text',
+            })
+            text.textContent = el['Description']
+            // we don't add mouseTarget to g, but to targetRects, because we
+            // want to layer this on top of everything at the end; otherwise, the
+            // LPs and lines will be over the target, which will create holes
+            // where hover etc. won't work
+            const mouseTarget = svgadd(targetRects, 'rect', {
+              'height': BOX_HEIGHT,
+              'width': width,
+              'x': x,
+              'y': y,
+              'class': 'target-rect',
+              'data-partition': partitionIndex,
+              'data-index': elIndex,
+            })
+            mouseTarget.onmouseover = handleMouseOver
+            mouseTarget.onmousemove = handleMouseMove
+            mouseTarget.onmouseout = handleMouseOut
+            mouseTarget.onclick = handleClick
+          })
+          historyRects.push(rects)
+        })
+
+        // draw partial linearizations
+        const illegalLast = data.map(partition => {
+          return partition['PartialLinearizations'].map(() => new Set())
+        })
+        const largestIllegal = data.map(() => {return {}})
+        const largestIllegalLength = data.map(() => {return {}})
+        const partialLayers = []
+        const errorPoints = []
+        data.forEach((partition, partitionIndex) => {
+          const l = []
+          partialLayers.push(l)
+          partition['PartialLinearizations'].forEach((lin, linIndex) => {
+            const g = svgadd(svg, 'g')
+            l.push(g)
+            let prevX = null
+            let prevY = null
+            let prevEl = null
+            const included = new Set()
+            lin.forEach(id => {
+              const el = partition['History'][id['Index']]
+              const hereX = PADDING + XOFF + xPos[el['Start']]
+              const x = prevX !== null ? Math.max(hereX, prevX + EPSILON) : hereX
+              const y = PADDING + el['ClientId'] * (BOX_HEIGHT + BOX_SPACE) - LINE_BLEED
+              // line from previous
+              if (prevEl !== null) {
+                svgadd(g, 'line', {
+                  'x1': prevX,
+                  'x2': x,
+                  'y1': prevEl['ClientId'] >= el['ClientId'] ? prevY : prevY + BOX_HEIGHT + 2*LINE_BLEED,
+                  'y2': prevEl['ClientId'] <= el['ClientId'] ? y : y + BOX_HEIGHT + 2*LINE_BLEED,
+                  'class': 'linearization linearization-line',
+                })
+              }
+              // current line
+              svgadd(g, 'line', {
+                'x1': x,
+                'x2': x,
+                'y1': y,
+                'y2': y + BOX_HEIGHT + 2*LINE_BLEED,
+                'class': 'linearization linearization-point'
+              })
+              prevX = x
+              prevY = y
+              prevEl = el
+              included.add(id['Index'])
+            })
+            // show possible but illegal next linearizations
+            // a history element is a possible next try
+            // if no other history element must be linearized earlier
+            // i.e. forall others, this.start < other.end
+            let minEnd = Infinity
+            partition['History'].forEach((el, index) => {
+              if (!included.has(index)) {
+                minEnd = Math.min(minEnd, el['End'])
+              }
+            })
+            partition['History'].forEach((el, index) => {
+              if (!included.has(index) && el['Start'] < minEnd) {
+                const hereX = PADDING + XOFF + xPos[el['Start']]
+                const x = prevX !== null ? Math.max(hereX, prevX + EPSILON) : hereX
+                const y = PADDING + el['ClientId'] * (BOX_HEIGHT + BOX_SPACE) - LINE_BLEED
+                // line from previous
+                svgadd(g, 'line', {
+                  'x1': prevX,
+                  'x2': x,
+                  'y1': prevEl['ClientId'] >= el['ClientId'] ? prevY : prevY + BOX_HEIGHT + 2*LINE_BLEED,
+                  'y2': prevEl['ClientId'] <= el['ClientId'] ? y : y + BOX_HEIGHT + 2*LINE_BLEED,
+                  'class': 'linearization-invalid linearization-line',
+                })
+                // current line
+                const point = svgadd(g, 'line', {
+                  'x1': x,
+                  'x2': x,
+                  'y1': y,
+                  'y2': y + BOX_HEIGHT + 2*LINE_BLEED,
+                  'class': 'linearization-invalid linearization-point',
+                })
+                errorPoints.push({
+                  x: x,
+                  partition: partitionIndex,
+                  index: lin[lin.length-1]['Index'], // NOTE not index
+                  element: point
+                })
+                illegalLast[partitionIndex][linIndex].add(index)
+                if (!Object.prototype.hasOwnProperty.call(largestIllegalLength[partitionIndex], index) || largestIllegalLength[partitionIndex][index] < lin.length) {
+                  largestIllegalLength[partitionIndex][index] = lin.length
+                  largestIllegal[partitionIndex][index] = linIndex
+                }
+              }
+            })
+          })
+        })
+        errorPoints.sort((a, b) => a.x - b.x)
+
+        // attach targetRects
+        svgattach(svg, targetRects)
+
+        // tooltip
+        const tooltip = document.getElementById('canvas').appendChild(document.createElement('div'))
+        tooltip.setAttribute('class', 'tooltip')
+
+        function handleMouseOver() {
+          if (!selected) {
+            const partition = parseInt(this.dataset['partition'])
+            const index = parseInt(this.dataset['index'])
+            highlight(partition, index)
+          }
+          tooltip.style.opacity = 1
+        }
+
+        function linearizationIndex(partition, index) {
+          // show this linearization
+          if (Object.prototype.hasOwnProperty.call(data[partition]['Largest'], index)) {
+            return data[partition]['Largest'][index]
+          } else if (Object.prototype.hasOwnProperty.call(largestIllegal[partition], index)) {
+            return largestIllegal[partition][index]
+          }
+          return null
+        }
+
+        function highlight(partition, index) {
+          // hide all but this partition
+          historyLayers.forEach((layer, i) => {
+            if (i === partition) {
+              layer.classList.remove('hidden')
+            } else {
+              layer.classList.add('hidden')
+            }
+          })
+          // hide all but the relevant linearization
+          partialLayers.forEach(layer => {
+            layer.forEach(g => {
+              g.classList.add('hidden')
+            })
+          })
+          // show this linearization
+          const maxIndex = linearizationIndex(partition, index)
+          if (maxIndex !== null) {
+            partialLayers[partition][maxIndex].classList.remove('hidden')
+          }
+          updateJump()
+        }
+
+        let lastTooltip = [null, null, null, null, null]
+        function handleMouseMove() {
+          const partition = parseInt(this.dataset['partition'])
+          const index = parseInt(this.dataset['index'])
+          const [sPartition, sIndex] = selectedIndex
+          const thisTooltip = [partition, index, selected, sPartition, sIndex]
+
+          if (!arrayEq(lastTooltip, thisTooltip)) {
+            let maxIndex
+            if (!selected) {
+              maxIndex = linearizationIndex(partition, index)
+            } else {
+              // if selected, show info relevant to the selected linearization
+              maxIndex = linearizationIndex(sPartition, sIndex)
+            }
+            if (selected && sPartition !== partition) {
+              tooltip.innerHTML = 'Not part of selected partition.'
+            } else if (maxIndex === null) {
+              if (!selected) {
+                tooltip.innerHTML = 'Not part of any partial linearization.'
+              } else {
+                tooltip.innerHTML = 'Selected element is not part of any partial linearization.'
+              }
+            } else {
+              const lin = data[partition]['PartialLinearizations'][maxIndex]
+              let prev = null, curr = null
+              let found = false
+              for (let i = 0; i < lin.length; i++) {
+                prev = curr
+                curr = lin[i]
+                if (curr['Index'] === index) {
+                  found = true
+                  break
+                }
+              }
+              let call = data[partition]['History'][index]['Start']
+              let ret = data[partition]['History'][index]['OriginalEnd']
+              let msg = ''
+              if (found) {
+                // part of linearization
+                if (prev !== null) {
+                  msg = '<strong>Previous state:</strong><br>' + prev['StateDescription'] + '<br><br>'
+                }
+                msg += '<strong>New state:</strong><br>' + curr['StateDescription'] +
+                  '<br><br>Call: ' + call +
+                  '<br><br>Return: ' + ret
+              } else if (illegalLast[partition][maxIndex].has(index)) {
+                // illegal next one
+                msg = '<strong>Previous state:</strong><br>' + lin[lin.length-1]['StateDescription'] +
+                  '<br><br><strong>New state:</strong><br>&langle;invalid op&rangle;' +
+                  '<br><br>Call: ' + call +
+                  '<br><br>Return: ' + ret
+              } else {
+                // not part of this one
+                msg = 'Not part of selected element\'s partial linearization.'
+              }
+              tooltip.innerHTML = msg
+            }
+            lastTooltip = thisTooltip
+          }
+          tooltip.style.left = (event.pageX+20) + 'px'
+          tooltip.style.top = (event.pageY+20) + 'px'
+        }
+
+        function handleMouseOut() {
+          if (!selected) {
+            resetHighlight()
+          }
+          tooltip.style.opacity = 0
+          lastTooltip = [null, null, null, null, null]
+        }
+
+        function resetHighlight() {
+          // show all layers
+          historyLayers.forEach(layer => {
+            layer.classList.remove('hidden')
+          })
+          // show longest linearizations, which are first
+          partialLayers.forEach(layers => {
+            layers.forEach((l, i) => {
+              if (i === 0) {
+                l.classList.remove('hidden')
+              } else {
+                l.classList.add('hidden')
+              }
+            })
+          })
+          updateJump()
+        }
+
+        function updateJump() {
+          const jump = document.getElementById('jump-link')
+          // find first non-hidden point
+          // feels a little hacky, but it works
+          const point = errorPoints.find(pt => !pt.element.parentElement.classList.contains('hidden'))
+          if (point) {
+            jump.classList.remove('inactive')
+            jump.onclick = () => {
+              point.element.scrollIntoView({behavior: 'smooth', inline: 'center', block: 'center'})
+              if (!selected) {
+                select(point.partition, point.index)
+              }
+            }
+          } else {
+            jump.classList.add('inactive')
+          }
+        }
+
+        function handleClick() {
+          const partition = parseInt(this.dataset['partition'])
+          const index = parseInt(this.dataset['index'])
+          if (selected) {
+            const [sPartition, sIndex] = selectedIndex
+            if (partition === sPartition && index === sIndex) {
+              deselect()
+              return
+            } else {
+              historyRects[sPartition][sIndex].classList.remove('selected')
+            }
+          }
+          select(partition, index)
+        }
+
+        function handleBgClick() {
+          deselect()
+        }
+
+        function select(partition, index) {
+          selected = true
+          selectedIndex = [partition, index]
+          highlight(partition, index)
+          historyRects[partition][index].classList.add('selected')
+        }
+
+        function deselect() {
+          if (!selected) {
+            return
+          }
+          selected = false
+          resetHighlight()
+          const [partition, index] = selectedIndex
+          historyRects[partition][index].classList.remove('selected')
+        }
+
+        handleMouseOut() // initialize, same as mouse out
+      }
+
+      const data = [{"History":[{"ClientId":0,"Start":1668196544941830774,"End":1668196544941831074,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941831774,"End":1668196544941842274,"Description":"Put(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941843674,"End":1668196544941843674,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941844174,"End":1668196544941844274,"Description":"Put(42) -\u003e 1"},{"ClientId":0,"Start":1668196544941844474,"End":1668196544941844574,"Description":"Get(42) -\u003e 1"},{"ClientId":0,"Start":1668196544941844874,"End":1668196544941844874,"Description":"Put(42) -\u003e 2"},{"ClientId":0,"Start":1668196544941844974,"End":1668196544941844974,"Description":"Get(42) -\u003e 2"},{"ClientId":0,"Start":1668196544941845074,"End":1668196544941845174,"Description":"Put(42) -\u003e 3"},{"ClientId":0,"Start":1668196544941845174,"End":1668196544941845274,"Description":"Get(42) -\u003e 3"},{"ClientId":0,"Start":1668196544941845774,"End":1668196544941845774,"Description":"Put(42) -\u003e 4"},{"ClientId":0,"Start":1668196544941845874,"End":1668196544941845874,"Description":"Get(42) -\u003e 4"},{"ClientId":0,"Start":1668196544941845974,"End":1668196544941846074,"Description":"Put(42) -\u003e 5"},{"ClientId":0,"Start":1668196544941846074,"End":1668196544941846174,"Description":"Get(42) -\u003e 5"},{"ClientId":0,"Start":1668196544941846174,"End":1668196544941846274,"Description":"Put(42) -\u003e 6"},{"ClientId":0,"Start":1668196544941846474,"End":1668196544941846774,"Description":"Del(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941846874,"End":1668196544941846874,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941846974,"End":1668196544941847074,"Description":"Put(42) -\u003e 7"},{"ClientId":0,"Start":1668196544941847474,"End":1668196544941847574,"Description":"Del(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941847574,"End":1668196544941847674,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941847674,"End":1668196544941847774,"Description":"Put(42) -\u003e 8"},{"ClientId":0,"Start":1668196544941847874,"End":1668196544941847874,"Description":"Del(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941847974,"End":1668196544941847974,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941848074,"End":1668196544941848074,"Description":"Put(42) -\u003e 9"},{"ClientId":0,"Start":1668196544941848174,"End":1668196544941848274,"Description":"Get(42) -\u003e 9"},{"ClientId":0,"Start":1668196544941848274,"End":1668196544941848374,"Description":"Put(42) -\u003e 10"},{"ClientId":0,"Start":1668196544941848474,"End":1668196544941848474,"Description":"Get(42) -\u003e 10"},{"ClientId":0,"Start":1668196544941848574,"End":1668196544941848574,"Description":"Put(42) -\u003e 11"},{"ClientId":0,"Start":1668196544941848674,"End":1668196544941848674,"Description":"Get(42) -\u003e 11"},{"ClientId":0,"Start":1668196544941848774,"End":1668196544941848774,"Description":"Put(42) -\u003e 12"},{"ClientId":0,"Start":1668196544941848874,"End":1668196544941848974,"Description":"Del(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941848974,"End":1668196544941849074,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941849074,"End":1668196544941849174,"Description":"Put(42) -\u003e 13"},{"ClientId":0,"Start":1668196544941849274,"End":1668196544941849274,"Description":"Get(42) -\u003e 13"},{"ClientId":0,"Start":1668196544941849874,"End":1668196544941849974,"Description":"Put(42) -\u003e 14"},{"ClientId":0,"Start":1668196544941850074,"End":1668196544941850174,"Description":"Get(42) -\u003e 14"},{"ClientId":0,"Start":1668196544941850174,"End":1668196544941850274,"Description":"Put(42) -\u003e 15"},{"ClientId":0,"Start":1668196544941850274,"End":1668196544941850374,"Description":"Get(42) -\u003e 15"},{"ClientId":0,"Start":1668196544941850474,"End":1668196544941850474,"Description":"Put(42) -\u003e 16"},{"ClientId":0,"Start":1668196544941850574,"End":1668196544941850674,"Description":"Get(42) -\u003e 16"},{"ClientId":0,"Start":1668196544941850674,"End":1668196544941850774,"Description":"Put(42) -\u003e 17"},{"ClientId":0,"Start":1668196544941850874,"End":1668196544941850874,"Description":"Get(42) -\u003e 17"},{"ClientId":0,"Start":1668196544941850974,"End":1668196544941850974,"Description":"Put(42) -\u003e 18"},{"ClientId":0,"Start":1668196544941851074,"End":1668196544941851174,"Description":"Get(42) -\u003e 18"},{"ClientId":0,"Start":1668196544941851174,"End":1668196544941851274,"Description":"Put(42) -\u003e 19"},{"ClientId":0,"Start":1668196544941851274,"End":1668196544941851374,"Description":"Del(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941851474,"End":1668196544941851474,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941851574,"End":1668196544941851574,"Description":"Put(42) -\u003e 20"},{"ClientId":0,"Start":1668196544941851674,"End":1668196544941851774,"Description":"Del(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941851774,"End":1668196544941851874,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941851874,"End":1668196544941851974,"Description":"Put(42) -\u003e 21"},{"ClientId":0,"Start":1668196544941852074,"End":1668196544941852074,"Description":"Get(42) -\u003e 21"},{"ClientId":0,"Start":1668196544941852174,"End":1668196544941852174,"Description":"Put(42) -\u003e 22"},{"ClientId":0,"Start":1668196544941852274,"End":1668196544941852274,"Description":"Get(42) -\u003e 22"},{"ClientId":0,"Start":1668196544941852374,"End":1668196544941852474,"Description":"Put(42) -\u003e 23"},{"ClientId":0,"Start":1668196544941852474,"End":1668196544941852574,"Description":"Get(42) -\u003e 23"},{"ClientId":0,"Start":1668196544941852574,"End":1668196544941852674,"Description":"Put(42) -\u003e 24"},{"ClientId":0,"Start":1668196544941852774,"End":1668196544941852774,"Description":"Get(42) -\u003e 24"},{"ClientId":0,"Start":1668196544941852874,"End":1668196544941852874,"Description":"Put(42) -\u003e 25"},{"ClientId":0,"Start":1668196544941852974,"End":1668196544941852974,"Description":"Get(42) -\u003e 25"},{"ClientId":0,"Start":1668196544941853074,"End":1668196544941853174,"Description":"Put(42) -\u003e 26"},{"ClientId":0,"Start":1668196544941853174,"End":1668196544941853274,"Description":"Get(42) -\u003e 26"},{"ClientId":0,"Start":1668196544941853274,"End":1668196544941853374,"Description":"Put(42) -\u003e 27"},{"ClientId":0,"Start":1668196544941853474,"End":1668196544941853474,"Description":"Del(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941853574,"End":1668196544941853574,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941853674,"End":1668196544941853774,"Description":"Put(42) -\u003e 28"},{"ClientId":0,"Start":1668196544941853774,"End":1668196544941853874,"Description":"Get(42) -\u003e 28"},{"ClientId":0,"Start":1668196544941853874,"End":1668196544941853974,"Description":"Put(42) -\u003e 29"},{"ClientId":0,"Start":1668196544941854074,"End":1668196544941854074,"Description":"Get(42) -\u003e 29"},{"ClientId":0,"Start":1668196544941854174,"End":1668196544941854174,"Description":"Put(42) -\u003e 30"},{"ClientId":0,"Start":1668196544941854274,"End":1668196544941854374,"Description":"Get(42) -\u003e 30"},{"ClientId":0,"Start":1668196544941854374,"End":1668196544941854474,"Description":"Put(42) -\u003e 31"},{"ClientId":0,"Start":1668196544941854574,"End":1668196544941854574,"Description":"Del(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941854674,"End":1668196544941854674,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941854774,"End":1668196544941854774,"Description":"Put(42) -\u003e 32"},{"ClientId":0,"Start":1668196544941861674,"End":1668196544941861774,"Description":"Del(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941861774,"End":1668196544941861874,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941861974,"End":1668196544941861974,"Description":"Put(42) -\u003e 33"},{"ClientId":0,"Start":1668196544941862174,"End":1668196544941862274,"Description":"Get(42) -\u003e 33"},{"ClientId":0,"Start":1668196544941862374,"End":1668196544941862374,"Description":"Put(42) -\u003e 34"},{"ClientId":0,"Start":1668196544941862474,"End":1668196544941862474,"Description":"Get(42) -\u003e 34"},{"ClientId":0,"Start":1668196544941862574,"End":1668196544941862674,"Description":"Put(42) -\u003e 35"},{"ClientId":0,"Start":1668196544941862674,"End":1668196544941862774,"Description":"Del(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941862874,"End":1668196544941862874,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941862974,"End":1668196544941862974,"Description":"Put(42) -\u003e 36"},{"ClientId":0,"Start":1668196544941863074,"End":1668196544941863074,"Description":"Get(42) -\u003e 36"},{"ClientId":0,"Start":1668196544941863174,"End":1668196544941863174,"Description":"Put(42) -\u003e 37"},{"ClientId":0,"Start":1668196544941863274,"End":1668196544941863374,"Description":"Del(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941863374,"End":1668196544941863474,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941863474,"End":1668196544941863574,"Description":"Put(42) -\u003e 38"},{"ClientId":0,"Start":1668196544941863674,"End":1668196544941863674,"Description":"Get(42) -\u003e 38"},{"ClientId":0,"Start":1668196544941863774,"End":1668196544941863774,"Description":"Put(42) -\u003e 39"},{"ClientId":0,"Start":1668196544941863874,"End":1668196544941863874,"Description":"Get(42) -\u003e 39"},{"ClientId":0,"Start":1668196544941863974,"End":1668196544941864074,"Description":"Put(42) -\u003e 40"},{"ClientId":0,"Start":1668196544941864074,"End":1668196544941864174,"Description":"Del(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941864174,"End":1668196544941864274,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941864274,"End":1668196544941864374,"Description":"Put(42) -\u003e 41"},{"ClientId":0,"Start":1668196544941864474,"End":1668196544941864474,"Description":"Get(42) -\u003e 41"},{"ClientId":0,"Start":1668196544941864574,"End":1668196544941864574,"Description":"Put(42) -\u003e 42"},{"ClientId":0,"Start":1668196544941864674,"End":1668196544941864774,"Description":"Get(42) -\u003e 42"},{"ClientId":0,"Start":1668196544941864774,"End":1668196544941864874,"Description":"Put(42) -\u003e 43"},{"ClientId":0,"Start":1668196544941864874,"End":1668196544941864974,"Description":"Get(42) -\u003e 43"},{"ClientId":0,"Start":1668196544941865074,"End":1668196544941865074,"Description":"Put(42) -\u003e 44"},{"ClientId":0,"Start":1668196544941865174,"End":1668196544941865174,"Description":"Get(42) -\u003e 44"},{"ClientId":0,"Start":1668196544941865274,"End":1668196544941865374,"Description":"Put(42) -\u003e 45"},{"ClientId":0,"Start":1668196544941865374,"End":1668196544941865474,"Description":"Get(42) -\u003e 45"},{"ClientId":0,"Start":1668196544941865474,"End":1668196544941865574,"Description":"Put(42) -\u003e 46"},{"ClientId":0,"Start":1668196544941865674,"End":1668196544941865674,"Description":"Get(42) -\u003e 46"},{"ClientId":0,"Start":1668196544941865774,"End":1668196544941865774,"Description":"Put(42) -\u003e 47"},{"ClientId":0,"Start":1668196544941865874,"End":1668196544941865874,"Description":"Get(42) -\u003e 47"},{"ClientId":0,"Start":1668196544941865974,"End":1668196544941865974,"Description":"Put(42) -\u003e 48"},{"ClientId":0,"Start":1668196544941866174,"End":1668196544941866274,"Description":"Get(42) -\u003e 48"},{"ClientId":0,"Start":1668196544941866274,"End":1668196544941866374,"Description":"Put(42) -\u003e 49"},{"ClientId":0,"Start":1668196544941866474,"End":1668196544941866474,"Description":"Get(42) -\u003e 49"},{"ClientId":0,"Start":1668196544941866574,"End":1668196544941866674,"Description":"Put(42) -\u003e 50"},{"ClientId":0,"Start":1668196544941866674,"End":1668196544941866774,"Description":"Get(42) -\u003e 50"},{"ClientId":0,"Start":1668196544941866774,"End":1668196544941866874,"Description":"Put(42) -\u003e 51"},{"ClientId":0,"Start":1668196544941866974,"End":1668196544941866974,"Description":"Get(42) -\u003e 51"},{"ClientId":0,"Start":1668196544941867074,"End":1668196544941867074,"Description":"Put(42) -\u003e 52"},{"ClientId":0,"Start":1668196544941867174,"End":1668196544941867274,"Description":"Get(42) -\u003e 52"},{"ClientId":0,"Start":1668196544941867274,"End":1668196544941867374,"Description":"Put(42) -\u003e 53"},{"ClientId":0,"Start":1668196544941867374,"End":1668196544941867474,"Description":"Del(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941867574,"End":1668196544941867574,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941867674,"End":1668196544941867674,"Description":"Put(42) -\u003e 54"},{"ClientId":0,"Start":1668196544941867774,"End":1668196544941867774,"Description":"Get(42) -\u003e 54"},{"ClientId":0,"Start":1668196544941867874,"End":1668196544941867974,"Description":"Put(42) -\u003e 55"},{"ClientId":0,"Start":1668196544941867974,"End":1668196544941868074,"Description":"Del(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941868174,"End":1668196544941868174,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941868274,"End":1668196544941868274,"Description":"Put(42) -\u003e 56"},{"ClientId":0,"Start":1668196544941868374,"End":1668196544941868474,"Description":"Del(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941868474,"End":1668196544941868574,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941868574,"End":1668196544941868674,"Description":"Put(42) -\u003e 57"},{"ClientId":0,"Start":1668196544941868674,"End":1668196544941868774,"Description":"Get(42) -\u003e 57"},{"ClientId":0,"Start":1668196544941868774,"End":1668196544941868874,"Description":"Put(42) -\u003e 58"},{"ClientId":0,"Start":1668196544941868974,"End":1668196544941868974,"Description":"Del(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941869074,"End":1668196544941869074,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941869174,"End":1668196544941869274,"Description":"Put(42) -\u003e 59"},{"ClientId":0,"Start":1668196544941869274,"End":1668196544941869374,"Description":"Get(42) -\u003e 59"},{"ClientId":0,"Start":1668196544941869374,"End":1668196544941869474,"Description":"Put(42) -\u003e 60"},{"ClientId":0,"Start":1668196544941869574,"End":1668196544941869574,"Description":"Get(42) -\u003e 60"},{"ClientId":0,"Start":1668196544941869674,"End":1668196544941869674,"Description":"Put(42) -\u003e 61"},{"ClientId":0,"Start":1668196544941869774,"End":1668196544941869774,"Description":"Get(42) -\u003e 61"},{"ClientId":0,"Start":1668196544941869874,"End":1668196544941869874,"Description":"Put(42) -\u003e 62"},{"ClientId":0,"Start":1668196544941870074,"End":1668196544941870074,"Description":"Get(42) -\u003e 62"},{"ClientId":0,"Start":1668196544941870174,"End":1668196544941870174,"Description":"Put(42) -\u003e 63"},{"ClientId":0,"Start":1668196544941870274,"End":1668196544941870274,"Description":"Get(42) -\u003e 63"},{"ClientId":0,"Start":1668196544941870374,"End":1668196544941870474,"Description":"Put(42) -\u003e 64"},{"ClientId":0,"Start":1668196544941870574,"End":1668196544941870674,"Description":"Del(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941872074,"End":1668196544941872174,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941872274,"End":1668196544941872274,"Description":"Put(42) -\u003e 65"},{"ClientId":0,"Start":1668196544941872474,"End":1668196544941872474,"Description":"Get(42) -\u003e 65"},{"ClientId":0,"Start":1668196544941872574,"End":1668196544941872574,"Description":"Put(42) -\u003e 66"},{"ClientId":0,"Start":1668196544941872674,"End":1668196544941872674,"Description":"Get(42) -\u003e 66"},{"ClientId":0,"Start":1668196544941872774,"End":1668196544941872774,"Description":"Put(42) -\u003e 67"},{"ClientId":0,"Start":1668196544941874274,"End":1668196544941874274,"Description":"Get(42) -\u003e 67"},{"ClientId":0,"Start":1668196544941874374,"End":1668196544941874474,"Description":"Put(42) -\u003e 68"},{"ClientId":0,"Start":1668196544941874574,"End":1668196544941874574,"Description":"Get(42) -\u003e 68"},{"ClientId":0,"Start":1668196544941874674,"End":1668196544941874674,"Description":"Put(42) -\u003e 69"},{"ClientId":0,"Start":1668196544941874774,"End":1668196544941874774,"Description":"Get(42) -\u003e 69"},{"ClientId":0,"Start":1668196544941874874,"End":1668196544941874874,"Description":"Put(42) -\u003e 70"},{"ClientId":0,"Start":1668196544941874974,"End":1668196544941875074,"Description":"Del(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941875174,"End":1668196544941875174,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941875274,"End":1668196544941875274,"Description":"Put(42) -\u003e 71"},{"ClientId":0,"Start":1668196544941875374,"End":1668196544941875374,"Description":"Get(42) -\u003e 71"},{"ClientId":0,"Start":1668196544941875474,"End":1668196544941875574,"Description":"Put(42) -\u003e 72"},{"ClientId":0,"Start":1668196544941875574,"End":1668196544941875674,"Description":"Get(42) -\u003e 72"},{"ClientId":0,"Start":1668196544941875674,"End":1668196544941875774,"Description":"Put(42) -\u003e 73"},{"ClientId":0,"Start":1668196544941875874,"End":1668196544941875874,"Description":"Get(42) -\u003e 73"},{"ClientId":0,"Start":1668196544941875974,"End":1668196544941875974,"Description":"Put(42) -\u003e 74"},{"ClientId":0,"Start":1668196544941876074,"End":1668196544941876074,"Description":"Get(42) -\u003e 74"},{"ClientId":0,"Start":1668196544941876174,"End":1668196544941876274,"Description":"Put(42) -\u003e 75"},{"ClientId":0,"Start":1668196544941876274,"End":1668196544941876374,"Description":"Get(42) -\u003e 75"},{"ClientId":0,"Start":1668196544941876374,"End":1668196544941876474,"Description":"Put(42) -\u003e 76"},{"ClientId":0,"Start":1668196544941876574,"End":1668196544941876574,"Description":"Get(42) -\u003e 76"},{"ClientId":0,"Start":1668196544941876674,"End":1668196544941876674,"Description":"Put(42) -\u003e 77"},{"ClientId":0,"Start":1668196544941876774,"End":1668196544941876774,"Description":"Get(42) -\u003e 77"},{"ClientId":0,"Start":1668196544941876874,"End":1668196544941876874,"Description":"Put(42) -\u003e 78"},{"ClientId":0,"Start":1668196544941876974,"End":1668196544941877074,"Description":"Get(42) -\u003e 78"},{"ClientId":0,"Start":1668196544941877074,"End":1668196544941877174,"Description":"Put(42) -\u003e 79"},{"ClientId":0,"Start":1668196544941877274,"End":1668196544941877274,"Description":"Get(42) -\u003e 79"},{"ClientId":0,"Start":1668196544941877374,"End":1668196544941877374,"Description":"Put(42) -\u003e 80"},{"ClientId":0,"Start":1668196544941877574,"End":1668196544941877574,"Description":"Get(42) -\u003e 80"},{"ClientId":0,"Start":1668196544941877674,"End":1668196544941877674,"Description":"Put(42) -\u003e 81"},{"ClientId":0,"Start":1668196544941877874,"End":1668196544941877874,"Description":"Get(42) -\u003e 81"},{"ClientId":0,"Start":1668196544941877974,"End":1668196544941877974,"Description":"Put(42) -\u003e 82"},{"ClientId":0,"Start":1668196544941878074,"End":1668196544941878174,"Description":"Del(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941878174,"End":1668196544941878274,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941878274,"End":1668196544941878374,"Description":"Put(42) -\u003e 83"},{"ClientId":0,"Start":1668196544941878474,"End":1668196544941878474,"Description":"Get(42) -\u003e 83"},{"ClientId":0,"Start":1668196544941878574,"End":1668196544941878574,"Description":"Put(42) -\u003e 84"},{"ClientId":0,"Start":1668196544941878674,"End":1668196544941878774,"Description":"Get(42) -\u003e 84"},{"ClientId":0,"Start":1668196544941878774,"End":1668196544941878874,"Description":"Put(42) -\u003e 85"},{"ClientId":0,"Start":1668196544941878974,"End":1668196544941878974,"Description":"Get(42) -\u003e 85"},{"ClientId":0,"Start":1668196544941879074,"End":1668196544941879074,"Description":"Put(42) -\u003e 86"},{"ClientId":0,"Start":1668196544941879174,"End":1668196544941879174,"Description":"Get(42) -\u003e 86"},{"ClientId":0,"Start":1668196544941879274,"End":1668196544941879374,"Description":"Put(42) -\u003e 87"},{"ClientId":0,"Start":1668196544941879374,"End":1668196544941879474,"Description":"Get(42) -\u003e 87"},{"ClientId":0,"Start":1668196544941879474,"End":1668196544941879574,"Description":"Put(42) -\u003e 88"},{"ClientId":0,"Start":1668196544941879674,"End":1668196544941879674,"Description":"Del(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941879774,"End":1668196544941879774,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941879874,"End":1668196544941879974,"Description":"Put(42) -\u003e 89"},{"ClientId":0,"Start":1668196544941879974,"End":1668196544941880074,"Description":"Get(42) -\u003e 89"},{"ClientId":0,"Start":1668196544941880074,"End":1668196544941880174,"Description":"Put(42) -\u003e 90"},{"ClientId":0,"Start":1668196544941880274,"End":1668196544941880274,"Description":"Get(42) -\u003e 90"},{"ClientId":0,"Start":1668196544941880374,"End":1668196544941880374,"Description":"Put(42) -\u003e 91"},{"ClientId":0,"Start":1668196544941880474,"End":1668196544941880474,"Description":"Get(42) -\u003e 91"},{"ClientId":0,"Start":1668196544941880574,"End":1668196544941880674,"Description":"Put(42) -\u003e 92"},{"ClientId":0,"Start":1668196544941880774,"End":1668196544941880774,"Description":"Del(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941880874,"End":1668196544941880874,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941880974,"End":1668196544941880974,"Description":"Put(42) -\u003e 93"},{"ClientId":0,"Start":1668196544941881074,"End":1668196544941881174,"Description":"Get(42) -\u003e 93"},{"ClientId":0,"Start":1668196544941881174,"End":1668196544941881274,"Description":"Put(42) -\u003e 94"},{"ClientId":0,"Start":1668196544941881374,"End":1668196544941881374,"Description":"Del(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941881474,"End":1668196544941881474,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941881574,"End":1668196544941881574,"Description":"Put(42) -\u003e 95"},{"ClientId":0,"Start":1668196544941881674,"End":1668196544941881774,"Description":"Del(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941881774,"End":1668196544941881874,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941881874,"End":1668196544941881974,"Description":"Put(42) -\u003e 96"},{"ClientId":0,"Start":1668196544941882074,"End":1668196544941882174,"Description":"Get(42) -\u003e 96"},{"ClientId":0,"Start":1668196544941882174,"End":1668196544941882274,"Description":"Put(42) -\u003e 97"},{"ClientId":0,"Start":1668196544941882374,"End":1668196544941882474,"Description":"Del(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941882474,"End":1668196544941882574,"Description":"Get(42) -\u003e 0"},{"ClientId":0,"Start":1668196544941882574,"End":1668196544941882674,"Description":"Put(42) -\u003e 98"},{"ClientId":0,"Start":1668196544941882774,"End":1668196544941882774,"Description":"Get(42) -\u003e 98"},{"ClientId":0,"Start":1668196544941882874,"End":1668196544941882974,"Description":"Put(42) -\u003e 99"}],"PartialLinearizations":[[{"Index":0,"StateDescription":"map[]"},{"Index":1,"StateDescription":"map[42:0]"},{"Index":2,"StateDescription":"map[42:0]"},{"Index":3,"StateDescription":"map[42:1]"},{"Index":4,"StateDescription":"map[42:1]"},{"Index":5,"StateDescription":"map[42:2]"},{"Index":6,"StateDescription":"map[42:2]"},{"Index":7,"StateDescription":"map[42:3]"},{"Index":8,"StateDescription":"map[42:3]"},{"Index":9,"StateDescription":"map[42:4]"},{"Index":10,"StateDescription":"map[42:4]"},{"Index":11,"StateDescription":"map[42:5]"},{"Index":12,"StateDescription":"map[42:5]"},{"Index":13,"StateDescription":"map[42:6]"},{"Index":14,"StateDescription":"map[]"},{"Index":15,"StateDescription":"map[]"},{"Index":16,"StateDescription":"map[42:7]"},{"Index":17,"StateDescription":"map[]"},{"Index":18,"StateDescription":"map[]"},{"Index":19,"StateDescription":"map[42:8]"},{"Index":20,"StateDescription":"map[]"},{"Index":21,"StateDescription":"map[]"},{"Index":22,"StateDescription":"map[42:9]"},{"Index":23,"StateDescription":"map[42:9]"},{"Index":24,"StateDescription":"map[42:10]"},{"Index":25,"StateDescription":"map[42:10]"},{"Index":26,"StateDescription":"map[42:11]"},{"Index":27,"StateDescription":"map[42:11]"},{"Index":28,"StateDescription":"map[42:12]"},{"Index":29,"StateDescription":"map[]"},{"Index":30,"StateDescription":"map[]"},{"Index":31,"StateDescription":"map[42:13]"},{"Index":32,"StateDescription":"map[42:13]"},{"Index":33,"StateDescription":"map[42:14]"},{"Index":34,"StateDescription":"map[42:14]"},{"Index":35,"StateDescription":"map[42:15]"},{"Index":36,"StateDescription":"map[42:15]"},{"Index":37,"StateDescription":"map[42:16]"},{"Index":38,"StateDescription":"map[42:16]"},{"Index":39,"StateDescription":"map[42:17]"},{"Index":40,"StateDescription":"map[42:17]"},{"Index":41,"StateDescription":"map[42:18]"},{"Index":42,"StateDescription":"map[42:18]"},{"Index":43,"StateDescription":"map[42:19]"},{"Index":44,"StateDescription":"map[]"},{"Index":45,"StateDescription":"map[]"},{"Index":46,"StateDescription":"map[42:20]"},{"Index":47,"StateDescription":"map[]"},{"Index":48,"StateDescription":"map[]"},{"Index":49,"StateDescription":"map[42:21]"},{"Index":50,"StateDescription":"map[42:21]"},{"Index":51,"StateDescription":"map[42:22]"},{"Index":52,"StateDescription":"map[42:22]"},{"Index":53,"StateDescription":"map[42:23]"},{"Index":54,"StateDescription":"map[42:23]"},{"Index":55,"StateDescription":"map[42:24]"},{"Index":56,"StateDescription":"map[42:24]"},{"Index":57,"StateDescription":"map[42:25]"},{"Index":58,"StateDescription":"map[42:25]"},{"Index":59,"StateDescription":"map[42:26]"},{"Index":60,"StateDescription":"map[42:26]"},{"Index":61,"StateDescription":"map[42:27]"},{"Index":62,"StateDescription":"map[]"},{"Index":63,"StateDescription":"map[]"},{"Index":64,"StateDescription":"map[42:28]"},{"Index":65,"StateDescription":"map[42:28]"},{"Index":66,"StateDescription":"map[42:29]"},{"Index":67,"StateDescription":"map[42:29]"},{"Index":68,"StateDescription":"map[42:30]"},{"Index":69,"StateDescription":"map[42:30]"},{"Index":70,"StateDescription":"map[42:31]"},{"Index":71,"StateDescription":"map[]"},{"Index":72,"StateDescription":"map[]"},{"Index":73,"StateDescription":"map[42:32]"},{"Index":74,"StateDescription":"map[]"},{"Index":75,"StateDescription":"map[]"},{"Index":76,"StateDescription":"map[42:33]"},{"Index":77,"StateDescription":"map[42:33]"},{"Index":78,"StateDescription":"map[42:34]"},{"Index":79,"StateDescription":"map[42:34]"},{"Index":80,"StateDescription":"map[42:35]"},{"Index":81,"StateDescription":"map[]"},{"Index":82,"StateDescription":"map[]"},{"Index":83,"StateDescription":"map[42:36]"},{"Index":84,"StateDescription":"map[42:36]"},{"Index":85,"StateDescription":"map[42:37]"},{"Index":86,"StateDescription":"map[]"},{"Index":87,"StateDescription":"map[]"},{"Index":88,"StateDescription":"map[42:38]"},{"Index":89,"StateDescription":"map[42:38]"},{"Index":90,"StateDescription":"map[42:39]"},{"Index":91,"StateDescription":"map[42:39]"},{"Index":92,"StateDescription":"map[42:40]"},{"Index":93,"StateDescription":"map[]"},{"Index":94,"StateDescription":"map[]"},{"Index":95,"StateDescription":"map[42:41]"},{"Index":96,"StateDescription":"map[42:41]"},{"Index":97,"StateDescription":"map[42:42]"},{"Index":98,"StateDescription":"map[42:42]"},{"Index":99,"StateDescription":"map[42:43]"},{"Index":100,"StateDescription":"map[42:43]"},{"Index":101,"StateDescription":"map[42:44]"},{"Index":102,"StateDescription":"map[42:44]"},{"Index":103,"StateDescription":"map[42:45]"},{"Index":104,"StateDescription":"map[42:45]"},{"Index":105,"StateDescription":"map[42:46]"},{"Index":106,"StateDescription":"map[42:46]"},{"Index":107,"StateDescription":"map[42:47]"},{"Index":108,"StateDescription":"map[42:47]"},{"Index":109,"StateDescription":"map[42:48]"},{"Index":110,"StateDescription":"map[42:48]"},{"Index":111,"StateDescription":"map[42:49]"},{"Index":112,"StateDescription":"map[42:49]"},{"Index":113,"StateDescription":"map[42:50]"},{"Index":114,"StateDescription":"map[42:50]"},{"Index":115,"StateDescription":"map[42:51]"},{"Index":116,"StateDescription":"map[42:51]"},{"Index":117,"StateDescription":"map[42:52]"},{"Index":118,"StateDescription":"map[42:52]"},{"Index":119,"StateDescription":"map[42:53]"},{"Index":120,"StateDescription":"map[]"},{"Index":121,"StateDescription":"map[]"},{"Index":122,"StateDescription":"map[42:54]"},{"Index":123,"StateDescription":"map[42:54]"},{"Index":124,"StateDescription":"map[42:55]"},{"Index":125,"StateDescription":"map[]"},{"Index":126,"StateDescription":"map[]"},{"Index":127,"StateDescription":"map[42:56]"},{"Index":128,"StateDescription":"map[]"},{"Index":129,"StateDescription":"map[]"},{"Index":130,"StateDescription":"map[42:57]"},{"Index":131,"StateDescription":"map[42:57]"},{"Index":132,"StateDescription":"map[42:58]"},{"Index":133,"StateDescription":"map[]"},{"Index":134,"StateDescription":"map[]"},{"Index":135,"StateDescription":"map[42:59]"},{"Index":136,"StateDescription":"map[42:59]"},{"Index":137,"StateDescription":"map[42:60]"},{"Index":138,"StateDescription":"map[42:60]"},{"Index":139,"StateDescription":"map[42:61]"},{"Index":140,"StateDescription":"map[42:61]"},{"Index":141,"StateDescription":"map[42:62]"},{"Index":142,"StateDescription":"map[42:62]"},{"Index":143,"StateDescription":"map[42:63]"},{"Index":144,"StateDescription":"map[42:63]"},{"Index":145,"StateDescription":"map[42:64]"},{"Index":146,"StateDescription":"map[]"},{"Index":147,"StateDescription":"map[]"},{"Index":148,"StateDescription":"map[42:65]"},{"Index":149,"StateDescription":"map[42:65]"},{"Index":150,"StateDescription":"map[42:66]"},{"Index":151,"StateDescription":"map[42:66]"},{"Index":152,"StateDescription":"map[42:67]"},{"Index":153,"StateDescription":"map[42:67]"},{"Index":154,"StateDescription":"map[42:68]"},{"Index":155,"StateDescription":"map[42:68]"},{"Index":156,"StateDescription":"map[42:69]"},{"Index":157,"StateDescription":"map[42:69]"},{"Index":158,"StateDescription":"map[42:70]"},{"Index":159,"StateDescription":"map[]"},{"Index":160,"StateDescription":"map[]"},{"Index":161,"StateDescription":"map[42:71]"},{"Index":162,"StateDescription":"map[42:71]"},{"Index":163,"StateDescription":"map[42:72]"},{"Index":164,"StateDescription":"map[42:72]"},{"Index":165,"StateDescription":"map[42:73]"},{"Index":166,"StateDescription":"map[42:73]"},{"Index":167,"StateDescription":"map[42:74]"},{"Index":168,"StateDescription":"map[42:74]"},{"Index":169,"StateDescription":"map[42:75]"},{"Index":170,"StateDescription":"map[42:75]"},{"Index":171,"StateDescription":"map[42:76]"},{"Index":172,"StateDescription":"map[42:76]"},{"Index":173,"StateDescription":"map[42:77]"},{"Index":174,"StateDescription":"map[42:77]"},{"Index":175,"StateDescription":"map[42:78]"},{"Index":176,"StateDescription":"map[42:78]"},{"Index":177,"StateDescription":"map[42:79]"},{"Index":178,"StateDescription":"map[42:79]"},{"Index":179,"StateDescription":"map[42:80]"},{"Index":180,"StateDescription":"map[42:80]"},{"Index":181,"StateDescription":"map[42:81]"},{"Index":182,"StateDescription":"map[42:81]"},{"Index":183,"StateDescription":"map[42:82]"},{"Index":184,"StateDescription":"map[]"},{"Index":185,"StateDescription":"map[]"},{"Index":186,"StateDescription":"map[42:83]"},{"Index":187,"StateDescription":"map[42:83]"},{"Index":188,"StateDescription":"map[42:84]"},{"Index":189,"StateDescription":"map[42:84]"},{"Index":190,"StateDescription":"map[42:85]"},{"Index":191,"StateDescription":"map[42:85]"},{"Index":192,"StateDescription":"map[42:86]"},{"Index":193,"StateDescription":"map[42:86]"},{"Index":194,"StateDescription":"map[42:87]"},{"Index":195,"StateDescription":"map[42:87]"},{"Index":196,"StateDescription":"map[42:88]"},{"Index":197,"StateDescription":"map[]"},{"Index":198,"StateDescription":"map[]"},{"Index":199,"StateDescription":"map[42:89]"},{"Index":200,"StateDescription":"map[42:89]"},{"Index":201,"StateDescription":"map[42:90]"},{"Index":202,"StateDescription":"map[42:90]"},{"Index":203,"StateDescription":"map[42:91]"},{"Index":204,"StateDescription":"map[42:91]"},{"Index":205,"StateDescription":"map[42:92]"},{"Index":206,"StateDescription":"map[]"},{"Index":207,"StateDescription":"map[]"},{"Index":208,"StateDescription":"map[42:93]"},{"Index":209,"StateDescription":"map[42:93]"},{"Index":210,"StateDescription":"map[42:94]"},{"Index":211,"StateDescription":"map[]"},{"Index":212,"StateDescription":"map[]"},{"Index":213,"StateDescription":"map[42:95]"},{"Index":214,"StateDescription":"map[]"},{"Index":215,"StateDescription":"map[]"},{"Index":216,"StateDescription":"map[42:96]"},{"Index":217,"StateDescription":"map[42:96]"},{"Index":218,"StateDescription":"map[42:97]"},{"Index":219,"StateDescription":"map[]"},{"Index":220,"StateDescription":"map[]"},{"Index":221,"StateDescription":"map[42:98]"},{"Index":222,"StateDescription":"map[42:98]"},{"Index":223,"StateDescription":"map[42:99]"}]],"Largest":{"0":0,"1":0,"10":0,"100":0,"101":0,"102":0,"103":0,"104":0,"105":0,"106":0,"107":0,"108":0,"109":0,"11":0,"110":0,"111":0,"112":0,"113":0,"114":0,"115":0,"116":0,"117":0,"118":0,"119":0,"12":0,"120":0,"121":0,"122":0,"123":0,"124":0,"125":0,"126":0,"127":0,"128":0,"129":0,"13":0,"130":0,"131":0,"132":0,"133":0,"134":0,"135":0,"136":0,"137":0,"138":0,"139":0,"14":0,"140":0,"141":0,"142":0,"143":0,"144":0,"145":0,"146":0,"147":0,"148":0,"149":0,"15":0,"150":0,"151":0,"152":0,"153":0,"154":0,"155":0,"156":0,"157":0,"158":0,"159":0,"16":0,"160":0,"161":0,"162":0,"163":0,"164":0,"165":0,"166":0,"167":0,"168":0,"169":0,"17":0,"170":0,"171":0,"172":0,"173":0,"174":0,"175":0,"176":0,"177":0,"178":0,"179":0,"18":0,"180":0,"181":0,"182":0,"183":0,"184":0,"185":0,"186":0,"187":0,"188":0,"189":0,"19":0,"190":0,"191":0,"192":0,"193":0,"194":0,"195":0,"196":0,"197":0,"198":0,"199":0,"2":0,"20":0,"200":0,"201":0,"202":0,"203":0,"204":0,"205":0,"206":0,"207":0,"208":0,"209":0,"21":0,"210":0,"211":0,"212":0,"213":0,"214":0,"215":0,"216":0,"217":0,"218":0,"219":0,"22":0,"220":0,"221":0,"222":0,"223":0,"23":0,"24":0,"25":0,"26":0,"27":0,"28":0,"29":0,"3":0,"30":0,"31":0,"32":0,"33":0,"34":0,"35":0,"36":0,"37":0,"38":0,"39":0,"4":0,"40":0,"41":0,"42":0,"43":0,"44":0,"45":0,"46":0,"47":0,"48":0,"49":0,"5":0,"50":0,"51":0,"52":0,"53":0,"54":0,"55":0,"56":0,"57":0,"58":0,"59":0,"6":0,"60":0,"61":0,"62":0,"63":0,"64":0,"65":0,"66":0,"67":0,"68":0,"69":0,"7":0,"70":0,"71":0,"72":0,"73":0,"74":0,"75":0,"76":0,"77":0,"78":0,"79":0,"8":0,"80":0,"81":0,"82":0,"83":0,"84":0,"85":0,"86":0,"87":0,"88":0,"89":0,"9":0,"90":0,"91":0,"92":0,"93":0,"94":0,"95":0,"96":0,"97":0,"98":0,"99":0}}]
+
+      render(data)
+    </script>
+  </body>
+</html>
